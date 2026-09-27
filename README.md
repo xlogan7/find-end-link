@@ -23,7 +23,7 @@ python -m venv .venv
 .\.venv\Scripts\python.exe crawler.py "https://example.com"
 ```
 
-## Current Workflow (only Focous on Phishing and Our Site)
+## Current Workflow (Phishing / Our Site)
 
 1. Open the starting URL, follow redirects, and inspect the rendered page and frames.
 2. Detect the Used Brand using brand.json.
