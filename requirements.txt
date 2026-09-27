@@ -1,0 +1,2 @@
+# Version used by the project's local development environment.
+playwright==1.62.0
