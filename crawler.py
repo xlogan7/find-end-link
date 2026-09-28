@@ -21,19 +21,214 @@ from urllib.parse import unquote, unquote_to_bytes, urljoin, urlparse, urlsplit,
 
 from playwright.sync_api import BrowserContext, Error, Locator, Page, TimeoutError, sync_playwright
 
-def challenge_present(page):
+CHROME_STEALTH_ARGS = [
+    "--disable-blink-features=AutomationControlled",
+    "--no-sandbox",
+    "--disable-infobars",
+    "--disable-dev-shm-usage",
+]
+
+
+def challenge_present(page) -> bool:
     try:
         return page.evaluate("""() => {
-            const title = document.title.toLowerCase();
+            const title = (document.title || '').toLowerCase();
             const text = (document.body?.innerText || '').toLowerCase();
-            return title.includes('just a moment') ||
+            const isChallenge = title.includes('just a moment') ||
                 ['verifying you are human', 'performing security verification',
                  'checking your browser', 'verify you are human'].some(s => text.includes(s)) ||
-                !!document.querySelector('#challenge-running, #challenge-stage');
+                !!document.querySelector('#challenge-running, #challenge-stage, #challenge-form');
+            if (isChallenge) return true;
+
+            const hasTurnstile = !!document.querySelector('.cf-turnstile, iframe[src*="challenges.cloudflare.com"], iframe[src*="turnstile"], input[name="cf-turnstile-response"]');
+            if (hasTurnstile) {
+                const token = document.querySelector("input[name='cf-turnstile-response']")?.value || '';
+                if (!token || token.length < 30) {
+                    return true;
+                }
+            }
+            return false;
         }""")
     except Error:
         # A document being replaced is not yet ready for export.
         return True
+
+
+def solve_turnstile(page: Page, timeout: float = 12.0) -> bool:
+    """Attempt automatic Turnstile verification resolution based on methods analyzed in turnstile_click.py:
+    1. Click container (.cf-turnstile)
+    2. Switch into Cloudflare iframe and click checkbox / .cb-i / label / body
+    3. Coordinate click on the widget/iframe
+    4. Wait for cf-turnstile-response token or challenge clearance
+    """
+    if not challenge_present(page):
+        return True
+
+    # Method 1: Click .cf-turnstile container
+    try:
+        widget = page.locator(".cf-turnstile").first
+        if widget.count() > 0 and widget.is_visible():
+            print("[Cloudflare] [Method 1] Clicking .cf-turnstile container...", file=sys.stderr, flush=True)
+            widget.click(timeout=2000)
+            page.wait_for_timeout(1000)
+    except Exception:
+        pass
+
+    if not challenge_present(page):
+        return True
+
+    # Method 2: Iframe + Checkbox
+    iframe_selectors = [
+        "iframe[src*='challenges.cloudflare.com']",
+        "iframe[src*='turnstile']",
+        "iframe[title*='Cloudflare']",
+        "iframe[title*='Widget containing']",
+    ]
+    checkbox_selectors = [
+        "input[type='checkbox']",
+        ".cb-i",
+        ".ctp-checkbox-label",
+        "label",
+        "#challenge-stage input[type='checkbox']",
+        "body",
+    ]
+
+    clicked = False
+    for frame in page.frames:
+        f_url = (frame.url or "").lower()
+        if "challenges.cloudflare.com" in f_url or "turnstile" in f_url:
+            for sel in checkbox_selectors:
+                try:
+                    el = frame.locator(sel).first
+                    if el.count() > 0 and el.is_visible():
+                        print(f"[Cloudflare] [Method 2] Clicking checkbox inside iframe ({sel})...", file=sys.stderr, flush=True)
+                        el.click(timeout=2000)
+                        clicked = True
+                        break
+                except Exception:
+                    continue
+            if clicked:
+                page.wait_for_timeout(1000)
+                break
+
+    if not clicked:
+        for ifr_sel in iframe_selectors:
+            try:
+                floc = page.frame_locator(ifr_sel)
+                for sel in checkbox_selectors:
+                    el = floc.locator(sel).first
+                    if el.count() > 0:
+                        print(f"[Cloudflare] [Method 2] Clicking {sel} via frame locator...", file=sys.stderr, flush=True)
+                        el.click(timeout=2000)
+                        clicked = True
+                        page.wait_for_timeout(1000)
+                        break
+                if clicked:
+                    break
+            except Exception:
+                continue
+
+    if not challenge_present(page):
+        return True
+
+    # Method 3: Coordinate click
+    try:
+        targets = [
+            "iframe[src*='challenges.cloudflare.com']",
+            "iframe[src*='turnstile']",
+            ".cf-turnstile",
+            "[data-sitekey]",
+            "#challenge-stage",
+        ]
+        for sel in targets:
+            loc = page.locator(sel).first
+            if loc.count() > 0 and loc.is_visible():
+                box = loc.bounding_box()
+                if box and box["width"] > 0 and box["height"] > 0:
+                    offset_x = box["x"] + min(28, box["width"] / 2)
+                    offset_y = box["y"] + box["height"] / 2
+                    print(f"[Cloudflare] [Method 3] Coordinate click at ({int(offset_x)}, {int(offset_y)}) on {sel}...", file=sys.stderr, flush=True)
+                    page.mouse.click(offset_x, offset_y)
+                    page.wait_for_timeout(1000)
+                    break
+    except Exception:
+        pass
+
+    # Method 4: Check for token or challenge clearance
+    deadline = time.monotonic() + max(0.0, timeout)
+    while time.monotonic() < deadline and not page.is_closed():
+        if not challenge_present(page):
+            return True
+        try:
+            token = page.evaluate("() => document.querySelector(\"input[name='cf-turnstile-response']\")?.value || ''")
+            if token and len(token) > 30:
+                print(f"[Cloudflare] Turnstile token received: {token[:40]}...", file=sys.stderr, flush=True)
+                return True
+        except Exception:
+            pass
+        page.wait_for_timeout(500)
+
+    return not challenge_present(page)
+
+
+def launch_chrome_context(
+    playwright,
+    headless: bool = False,
+    user_data_dir: str | Path | None = "chrome-session",
+    channel: str = "chrome",
+    accept_downloads: bool = False,
+    ignore_https_errors: bool = True,
+) -> BrowserContext:
+    """Launch real local Chrome browser with a persistent user profile and stealth options."""
+    profile_path = Path(user_data_dir or "chrome-session").resolve()
+    profile_path.mkdir(parents=True, exist_ok=True)
+
+    try:
+        return playwright.chromium.launch_persistent_context(
+            str(profile_path),
+            channel=channel,
+            headless=headless,
+            ignore_https_errors=ignore_https_errors,
+            accept_downloads=accept_downloads,
+            ignore_default_args=["--enable-automation"],
+            args=CHROME_STEALTH_ARGS,
+        )
+    except Exception as exc:
+        err = str(exc)
+        if "ProcessSingleton" in err or "in use by another instance" in err:
+            fallback_dir = profile_path.parent / f"{profile_path.name}_temp_{int(time.time())}"
+            fallback_dir.mkdir(parents=True, exist_ok=True)
+            print(f"[Browser] Profile directory {profile_path} is locked. Using fallback profile: {fallback_dir}",
+                  file=sys.stderr, flush=True)
+            try:
+                return playwright.chromium.launch_persistent_context(
+                    str(fallback_dir),
+                    channel=channel,
+                    headless=headless,
+                    ignore_https_errors=ignore_https_errors,
+                    accept_downloads=accept_downloads,
+                    ignore_default_args=["--enable-automation"],
+                    args=CHROME_STEALTH_ARGS,
+                )
+            except Exception:
+                pass
+
+        if channel == "chrome":
+            print(f"[Browser] Real Chrome launch failed ({exc}). Falling back to Chromium.", file=sys.stderr, flush=True)
+            try:
+                return playwright.chromium.launch_persistent_context(
+                    str(profile_path),
+                    headless=headless,
+                    ignore_https_errors=ignore_https_errors,
+                    accept_downloads=accept_downloads,
+                    ignore_default_args=["--enable-automation"],
+                    args=CHROME_STEALTH_ARGS,
+                )
+            except Exception:
+                browser = playwright.chromium.launch(headless=headless, args=CHROME_STEALTH_ARGS)
+                return browser.new_context(ignore_https_errors=ignore_https_errors, accept_downloads=accept_downloads)
+
+        raise
 
 
 LOGO_CANDIDATES_JS = r"""brand => {
@@ -435,7 +630,17 @@ def page_signature(page: Page) -> str:
 def wait_for_verification(page: Page, seconds: float, headless: bool) -> bool:
     if not challenge_present(page):
         return True
+    print("[Cloudflare] Cloudflare verification detected", file=sys.stderr, flush=True)
     print(f"Verification required at {page.url}.", file=sys.stderr, flush=True)
+
+    if seconds > 0:
+        print("[Cloudflare] Attempting automatic Turnstile verification resolution...", file=sys.stderr, flush=True)
+        if solve_turnstile(page, timeout=min(seconds, 12)):
+            settle(page)
+            if not challenge_present(page):
+                print(f"Verification cleared: {page.url}", file=sys.stderr, flush=True)
+                return True
+
     if not headless:
         page.bring_to_front()
         print("Complete verification in the browser if prompted. Crawling resumes automatically.",
@@ -454,6 +659,7 @@ def wait_for_verification(page: Page, seconds: float, headless: bool) -> bool:
                 return True
         if time.monotonic() >= next_update:
             print("Still waiting for website verification...", file=sys.stderr, flush=True)
+            solve_turnstile(page, timeout=3)
             next_update = time.monotonic() + 15
     return False
 
@@ -479,16 +685,16 @@ def choose_active_page(context: BrowserContext, prior_pages: list[Page], current
     return current
 
 
-def crawl(start_url: str, headless: bool = True, output_dir=None, challenge_timeout=0) -> tuple[list[Step], str, str, str]:
+def crawl(start_url: str, headless: bool = True, output_dir=None, challenge_timeout=0,
+          user_data_dir: str | Path = "chrome-session") -> tuple[list[Step], str, str, str]:
     start_url = parse_start_url(start_url)
 
     steps: list[Step] = []
     stop_reason = "No relevant clickable action exists."
 
     with sync_playwright() as playwright:
-        browser = playwright.chromium.launch(headless=headless)
-        context = browser.new_context(ignore_https_errors=True)
-        page = context.new_page()
+        context = launch_chrome_context(playwright, headless=headless, user_data_dir=user_data_dir)
+        page = context.pages[0] if context.pages else context.new_page()
 
         navigation_events: list[str] = []
 
@@ -527,6 +733,7 @@ def crawl(start_url: str, headless: bool = True, output_dir=None, challenge_time
 
         for click_number in range(1, MAX_CLICKS + 1):
             if challenge_present(page):
+                print("[Cloudflare] Cloudflare verification detected", file=sys.stderr, flush=True)
                 stop_reason = "Blocked by browser verification challenge. Destination not reached; content and logo were not exported."
                 break
             candidate = find_best_candidate(page)
@@ -536,6 +743,7 @@ def crawl(start_url: str, headless: bool = True, output_dir=None, challenge_time
                 candidate = find_best_candidate(page)
             if candidate is None:
                 if challenge_present(page):
+                    print("[Cloudflare] Cloudflare verification detected", file=sys.stderr, flush=True)
                     stop_reason = "A browser verification challenge blocks further navigation; this is the last reached URL."
                 break
 
@@ -597,10 +805,11 @@ def crawl(start_url: str, headless: bool = True, output_dir=None, challenge_time
 
         final_url = page.url
         if challenge_present(page):
+            print("[Cloudflare] Cloudflare verification detected", file=sys.stderr, flush=True)
             stop_reason = "Blocked by browser verification challenge. Destination not reached; content and logo were not exported."
         if output_dir is not None:
             save_final_page(page, output_dir, stop_reason)
-        browser.close()
+        context.close()
         return steps, initial_url, final_url, stop_reason
 
 
@@ -633,11 +842,12 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument('--max-pages', type=int, default=100, help='Maximum navigation attempts per run; 0 checks until the queue is exhausted')
     parser.add_argument('--legacy', action='store_true', help='Use the original prioritized button-chain crawler')
     parser.add_argument("--output-dir", default="Output", help="Folder for page HTML, logos, favicons and reports (default: Output)")
+    parser.add_argument("--user-data-dir", default="chrome-session", help="Path to local Chrome profile directory (default: chrome-session)")
     mode = parser.add_mutually_exclusive_group()
     mode.add_argument(
         "--headed",
         action="store_true",
-        help="Show Chromium while crawling (useful for debugging).",
+        help="Show Chrome while crawling (useful for debugging).",
     )
     mode.add_argument("--headless", action="store_true", help="Hide the browser; terminal Y/N prompts remain enabled.")
     parser.add_argument("--challenge-timeout", type=float, default=180,
@@ -655,11 +865,13 @@ def main() -> int:
             raise ValueError('--max-pages must be nonnegative (0 means unlimited)')
         if not args.legacy:
             report = crawl_all(args.url, load_brands(args.brands), args.output_dir,
-                args.headless, args.challenge_timeout, args.max_pages)
+                args.headless, args.challenge_timeout, args.max_pages,
+                user_data_dir=args.user_data_dir)
             return 2 if report['status'] == 'LIMIT REACHED' or any(
                 p['classification'] == 'BLOCKED' for p in report['pages']) else 1 if report['errors'] else 0
         steps, initial_url, final_url, reason = crawl(args.url, headless=args.headless,
-            output_dir=args.output_dir, challenge_timeout=args.challenge_timeout)
+            output_dir=args.output_dir, challenge_timeout=args.challenge_timeout,
+            user_data_dir=args.user_data_dir)
         print_report(args.url, steps, initial_url, final_url, reason)
         return 2 if reason.startswith("Blocked") else 1 if reason.startswith("Could not click") else 0
     except KeyboardInterrupt:
@@ -861,7 +1073,8 @@ def snapshot_controls(frame):
 
 def crawl_all(start_url, brands, output_dir='Output', headless=False,
               challenge_timeout=180, max_pages=100,
-              classifier=human_logo, asset_extensions=ASSET_EXTENSIONS):
+              classifier=human_logo, asset_extensions=ASSET_EXTENSIONS,
+              user_data_dir: str | Path = "chrome-session"):
     start_url = parse_start_url(start_url)
     from datetime import datetime
     root = Path(output_dir) / datetime.now().strftime('crawl_%Y%m%d_%H%M%S_%f')
@@ -921,8 +1134,7 @@ def crawl_all(start_url, brands, output_dir='Output', headless=False,
         return sorted(counts, key=lambda url: (priorities.get(url, fallback), -counts[url]))
 
     with sync_playwright() as pw:
-        browser = pw.chromium.launch(headless=headless)
-        context = browser.new_context(ignore_https_errors=True, accept_downloads=False)
+        context = launch_chrome_context(pw, headless=headless, user_data_dir=user_data_dir, accept_downloads=False)
         context.set_default_timeout(5000)
         try:
             while queue and (max_pages == 0 or attempts < max_pages) and not finished:
@@ -932,7 +1144,7 @@ def crawl_all(start_url, brands, output_dir='Output', headless=False,
                     print(f'[Skip] Already visited: {requested}', flush=True)
                     continue
                 attempts += 1
-                page = context.new_page()
+                page = context.pages[0] if context.pages else context.new_page()
                 record = {'requested_url': requested}
                 try:
                     requested_key = url_key(requested)
@@ -1061,8 +1273,10 @@ def crawl_all(start_url, brands, output_dir='Output', headless=False,
                     report['errors'].append({'url': requested, 'error': str(exc)})
                     print(f'Could not inspect {requested}: {exc}', flush=True)
                 finally:
+                    next_page = context.new_page()
                     for opened in list(context.pages):
-                        opened.close()
+                        if opened != next_page:
+                            opened.close()
                     (root / 'report.json').write_text(json.dumps(report, indent=2), encoding='utf-8')
             report['pending_count'] = len(queue)
             blocked = any(p['classification'] == 'BLOCKED' for p in report['pages'])
@@ -1075,7 +1289,7 @@ def crawl_all(start_url, brands, output_dir='Output', headless=False,
             report['status'] = 'CLASSIFIED' if finished else 'LIMIT REACHED' if queue else 'COMPLETED WITH ERRORS' if report['errors'] else 'COMPLETED'
         finally:
             (root / 'report.json').write_text(json.dumps(report, indent=2), encoding='utf-8')
-            browser.close()
+            context.close()
     print(f'\n{report["classification"]} - {report["status"]}. Report: {(root / "report.json").resolve()}')
     return report
 
